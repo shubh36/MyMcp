@@ -5,34 +5,12 @@ import fetch from "node-fetch";
 
 // 🚀 MCP Server setup
 const server = new McpServer({
-  name: "Cee BillingData Fetcher",
+  name: "Apis Data Fetcher",
   version: "1.0.0"
 });
 
-// 🎯 Dummy MAU data based on client name
-async function getMauByClientName(clientName) {
-  const name = clientName.toLowerCase();
-  if (name === "dream11") return { mau: 14050600 };
-  if (name === "bajajfinserv") return { mau: 1066070 };
-  return { error: "Unable to get MAU data for the specified client." };
-}
-
-// 🛠️ Tool: Get MAU Data
-server.tool(
-  "getMauDataByClientName",
-  {
-    clientName: z.string()
-  },
-  async ({ clientName }) => {
-    const data = await getMauByClientName(clientName);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data) }]
-    };
-  }
-);
-
-// 📊 API call to fetch campaign summary
-async function getCampaignSummaryReport(cid) {
+// 📊 API call to fetch campaign summary for a specific channel
+async function getSentCountByChannel(cid, channel) {
   const url = "http://vertica-csr-348419287.us-east-1.elb.amazonaws.com/v1/campaign-summary-reports";
 
   const body = {
@@ -43,17 +21,17 @@ async function getCampaignSummaryReport(cid) {
       tz: "Asia/Jakarta",
       campaign_type: "broadcast",
       tags: [],
-      combinations: [{ channel: "email", msgid: [] }]
+      combinations: [{ channel: channel, msgid: [] }]
     },
     output: {
-      channel: ["email"],
+      channel: [channel],
       categories: ["d"],
       total: ["sent"]
     }
   };
 
   try {
-    console.log("➡️ Sending request to campaign summary API with body:");
+    console.log(`➡️ Sending request to campaign summary API for ${channel}:`);
     console.log(JSON.stringify(body, null, 2));
 
     const response = await fetch(url, {
@@ -68,118 +46,122 @@ async function getCampaignSummaryReport(cid) {
     }
 
     const jsonResponse = await response.json();
-
-    console.log("✅ Received response from campaign summary API:");
+    console.log(`✅ Response from API for ${channel}:`);
     console.log(JSON.stringify(jsonResponse, null, 2));
-
     return jsonResponse;
   } catch (error) {
-    console.error("🔥 Exception while calling campaign summary API:", error);
+    console.error(`🔥 Error calling API for ${channel}:`, error);
     return { error: error.message || "Unknown error" };
   }
 }
 
-// 🛠️ Tool: Get Campaign Summary
-server.tool(
-  "getCampaignSummaryReport",
-  {
-    cid: z.number()
-  },
-  async ({ cid }) => {
-    const apiResponse = await getCampaignSummaryReport(cid);
-    let sent = null;
-    let reason = "";
+// 🛠️ Tool generator for email, sms, apn
+function createChannelTool(channel) {
+  server.tool(
+    `get${channel.charAt(0).toUpperCase() + channel.slice(1)}SentCount`,
+    {
+      clientId: z.number()
+    },
+    async ({ clientId }) => {
+      const apiResponse = await getSentCountByChannel(clientId, channel);
+      let sent = null;
+      let reason = "";
 
-    try {
-      const series = apiResponse.data?.[0]?.series;
-      if (Array.isArray(series)) {
-        const sentEntry = series.find(s => s.name === "total_sent");
-        if (sentEntry && Array.isArray(sentEntry.data)) {
-          sent = sentEntry.data[0];
+      try {
+        const series = apiResponse.data?.[0]?.series;
+        if (Array.isArray(series)) {
+          const sentEntry = series.find(s => s.name === "total_sent");
+          if (sentEntry && Array.isArray(sentEntry.data)) {
+            sent = sentEntry.data[0];
+          } else {
+            reason = "total_sent not found or data array missing.";
+          }
         } else {
-          reason = "total_sent not found or data array missing.";
+          reason = "series array is missing or not in expected format.";
         }
-      } else {
-        reason = "series array is missing or not in expected format.";
+      } catch (e) {
+        reason = `Parsing error: ${e.message}`;
+        console.error("❌ Parsing error:", e);
       }
-    } catch (e) {
-      reason = "Exception occurred during response parsing.";
-      console.error("❌ Parsing error:", e);
-    }
 
-    if (sent !== null && sent !== undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Email sent count for client ID ${cid} is ${sent}.`
-          }
-        ]
-      };
-    } else {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `I'm still unable to retrieve the email sent count for client ID ${cid} due to a technical issue.\nReason: ${reason}`
-          }
-        ]
-      };
+      if (sent !== null && sent !== undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${channel.toUpperCase()} sent count for client ID ${clientId} is ${sent}.`
+            }
+          ]
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Unable to retrieve ${channel.toUpperCase()} sent count for client ID ${clientId}.\nReason: ${reason}`
+            }
+          ]
+        };
+      }
     }
-  }
-);
+  );
+}
 
-// 🛠️ Tool: Fallback or future use
+// 🛠️ Register tools
+createChannelTool("email");
+createChannelTool("sms");
+createChannelTool("apn");
+
+// 🛠️ Unified tool: Get all channel counts
 server.tool(
-  "getEmailSentCount",
+  "getAllChannelSentCounts",
   {
     clientId: z.number()
   },
   async ({ clientId }) => {
-    const apiResponse = await getCampaignSummaryReport(clientId);
-    let sent = null;
-    let reason = "";
+    const channels = ["email", "sms", "apn"];
+    const results = [];
 
-    try {
-      const series = apiResponse.data?.[0]?.series;
-      if (Array.isArray(series)) {
-        const sentEntry = series.find(s => s.name === "total_sent");
-        if (sentEntry && Array.isArray(sentEntry.data)) {
-          sent = sentEntry.data[0];
+    for (const channel of channels) {
+      const apiResponse = await getSentCountByChannel(clientId, channel);
+      let sent = null;
+      let reason = "";
+
+      try {
+        const series = apiResponse.data?.[0]?.series;
+        if (Array.isArray(series)) {
+          const sentEntry = series.find(s => s.name === "total_sent");
+          if (sentEntry && Array.isArray(sentEntry.data)) {
+            sent = sentEntry.data[0];
+          } else {
+            reason = "total_sent not found or data array missing.";
+          }
         } else {
-          reason = "total_sent not found or data array missing.";
+          reason = "series array is missing or not in expected format.";
         }
-      } else {
-        reason = "series array is missing or not in expected format.";
+      } catch (e) {
+        reason = `Parsing error: ${e.message}`;
       }
-    } catch (e) {
-      reason = "Exception occurred during response parsing.";
-      console.error("❌ Parsing error:", e);
+
+      if (sent !== null && sent !== undefined) {
+        results.push(`✅ ${channel.toUpperCase()} sent count: ${sent}`);
+      } else {
+        results.push(`⚠️ ${channel.toUpperCase()} failed. Reason: ${reason}`);
+      }
     }
 
-    if (sent !== null && sent !== undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Email sent count for client ID ${clientId} is ${sent}.`
-          }
-        ]
-      };
-    } else {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `I'm still unable to retrieve the email sent count for client ID ${clientId} due to a technical issue.\nReason: ${reason}\nWould you like to try a different client ID, or is there another way I can assist you? If this is urgent, you might want to check whether the backend service is running or if there are any connectivity issues.`
-          }
-        ]
-      };
-    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `📦 Sent counts for client ID ${clientId}:\n` + results.join("\n")
+        }
+      ]
+    };
   }
 );
 
-// 🚀 Initialize with Stdio for Cursor
+// 🚀 Start MCP server
 async function init() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
