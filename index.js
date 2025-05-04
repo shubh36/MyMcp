@@ -3,26 +3,21 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import fetch from "node-fetch";
 
-// ---------------------------
-// 🚀 Initialize MCP Server
-// ---------------------------
+// 🚀 MCP Server setup
 const server = new McpServer({
-  name: "Campaign Sent Count Fetcher",
-  version: "1.0.0"
+  name: "Channel Sent Count Fetcher",
+  version: "1.1.0"
 });
 
-// ---------------------------
-// 🌐 API Call Utility
-// ---------------------------
-async function getSentCountByChannel(cid, channel) {
+// 🌐 Function to call the API
+async function getSentCountByChannel(cid, channel, start, end, tz = "Asia/Jakarta") {
   const url = "http://vertica-csr-348419287.us-east-1.elb.amazonaws.com/v1/campaign-summary-reports";
-
-  const requestBody = {
+  const body = {
     cid,
     input: {
-      start: "2025-03-18 00:00:00",
-      end: "2025-03-18 23:59:59",
-      tz: "Asia/Jakarta",
+      start,
+      end,
+      tz,
       campaign_type: "broadcast",
       tags: [],
       combinations: [{ channel, msgid: [] }]
@@ -35,53 +30,58 @@ async function getSentCountByChannel(cid, channel) {
   };
 
   try {
+    console.log(`➡️ Sending request for ${channel.toUpperCase()}...`);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
+      console.error(`❌ Failed ${channel.toUpperCase()} API call:`, response.status);
       return { error: `API error: ${response.status}` };
     }
 
-    return await response.json();
-  } catch (error) {
-    return { error: error.message || "Unknown error" };
+    const json = await response.json();
+    console.log(`✅ Received ${channel.toUpperCase()} response:`, JSON.stringify(json, null, 2));
+    return json;
+  } catch (err) {
+    console.error(`🔥 Error calling ${channel.toUpperCase()} API:`, err);
+    return { error: err.message };
   }
 }
 
-// ---------------------------
-// 📊 Result Parser
-// ---------------------------
-function parseSentCount(response) {
-  try {
-    const series = response.data?.[0]?.series;
-    const sentEntry = series?.find(s => s.name === "total_sent");
-    return sentEntry?.data?.[0] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------
-// 🛠️ Create Tool per Channel
-// ---------------------------
-function registerChannelTool(channel) {
+// 🔨 Register tool per channel
+function createChannelTool(channel) {
   server.tool(
     `get${channel.charAt(0).toUpperCase() + channel.slice(1)}SentCount`,
-    { clientId: z.number() },
-    async ({ clientId }) => {
-      const res = await getSentCountByChannel(clientId, channel);
-      const sent = parseSentCount(res);
+    {
+      clientId: z.number(),
+      start: z.string().default("2025-03-18 00:00:00"),
+      end: z.string().default("2025-03-18 23:59:59"),
+      tz: z.string().default("Asia/Jakarta")
+    },
+    async ({ clientId, start, end, tz }) => {
+      const apiResponse = await getSentCountByChannel(clientId, channel, start, end, tz);
+      let sent = null;
+      let reason = "";
+
+      try {
+        const series = apiResponse.data?.[0]?.series;
+        const sentEntry = series?.find(s => s.name === "total_sent");
+        sent = sentEntry?.data?.[0];
+        if (sent == null) reason = "Missing total_sent data.";
+      } catch (e) {
+        reason = `Parsing error: ${e.message}`;
+      }
 
       return {
         content: [
           {
             type: "text",
-            text: sent !== null
-              ? `✅ ${channel.toUpperCase()} sent count for client ID ${clientId}: ${sent}`
-              : `⚠️ Failed to retrieve ${channel.toUpperCase()} sent count for client ID ${clientId}.`
+            text: sent != null
+              ? `${channel.toUpperCase()} sent count for client ID ${clientId} is ${sent}.`
+              : `⚠️ Unable to retrieve ${channel.toUpperCase()} sent count for client ID ${clientId}.\nReason: ${reason}`
           }
         ]
       };
@@ -89,27 +89,40 @@ function registerChannelTool(channel) {
   );
 }
 
-// Register tools for individual channels
-["email", "sms", "apn", "whatsapp"].forEach(registerChannelTool);
+// ✅ Register tools
+["email", "sms", "apn", "whatsapp"].forEach(createChannelTool);
 
-// ---------------------------
-// 🧰 Tool: All Channel Counts
-// ---------------------------
+// 🧩 Unified multi-channel tool
 server.tool(
   "getAllChannelSentCounts",
-  { clientId: z.number() },
-  async ({ clientId }) => {
-    const channels = ["email", "sms", "apn", "whatsapp"];
+  {
+    clientId: z.number(),
+    start: z.string().default("2025-03-18 00:00:00"),
+    end: z.string().default("2025-03-18 23:59:59"),
+    tz: z.string().default("Asia/Jakarta"),
+    channels: z.array(z.enum(["email", "sms", "apn", "whatsapp"])).default(["email", "sms", "apn", "whatsapp"])
+  },
+  async ({ clientId, start, end, tz, channels }) => {
     const results = [];
 
     for (const channel of channels) {
-      const res = await getSentCountByChannel(clientId, channel);
-      const sent = parseSentCount(res);
+      const apiResponse = await getSentCountByChannel(clientId, channel, start, end, tz);
+      let sent = null;
+      let reason = "";
+
+      try {
+        const series = apiResponse.data?.[0]?.series;
+        const sentEntry = series?.find(s => s.name === "total_sent");
+        sent = sentEntry?.data?.[0];
+        if (sent == null) reason = "Missing total_sent data.";
+      } catch (e) {
+        reason = `Parsing error: ${e.message}`;
+      }
 
       results.push(
-        sent !== null
+        sent != null
           ? `✅ ${channel.toUpperCase()}: ${sent}`
-          : `⚠️ ${channel.toUpperCase()}: Failed to retrieve count`
+          : `⚠️ ${channel.toUpperCase()} failed. Reason: ${reason}`
       );
     }
 
@@ -117,16 +130,14 @@ server.tool(
       content: [
         {
           type: "text",
-          text: `📦 Sent counts for client ID ${clientId}:\n` + results.join("\n")
+          text: `📊 Sent counts for Client ID ${clientId}:\n` + results.join("\n")
         }
       ]
     };
   }
 );
 
-// ---------------------------
-// 🚀 Start MCP Server (Cursor-ready)
-// ---------------------------
+// 🚀 Start the server
 async function init() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
